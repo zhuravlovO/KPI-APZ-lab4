@@ -1,3 +1,3 @@
-module github.com/roman-mazur/design-practice-2-template
+module github.com/roman-mazur/architecture-practice-4-template
 
-go 1.20
+go 1.22
