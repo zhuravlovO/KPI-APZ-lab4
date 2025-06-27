@@ -4,4 +4,5 @@ WORKDIR /go/src/practice-4
 COPY . .
 
 ENV INTEGRATION_TEST=1
+ENV CGO_ENABLED=0
 ENTRYPOINT ["go", "test", "./integration"]

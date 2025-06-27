@@ -3,6 +3,7 @@ FROM golang:1.24 AS build
 WORKDIR /go/src/practice-4
 COPY . .
 
+ENV CGO_ENABLED=0
 RUN go test ./...
 ENV CGO_ENABLED=0
 RUN go install ./cmd/...
