@@ -1,0 +1,15 @@
+name: Go Build and Test
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Run integration tests
+        run: docker-compose -f docker-compose.yaml -f docker-compose.test.yaml up --build --exit-code-from test
