@@ -1,11 +1,18 @@
 #!/usr/bin/env sh
 
-bin=$1
+bin="$1"
 shift
 
 if [ -z "$bin" ]; then
-  echo "binary is not defined"
+  echo "Error: binary is not defined"
   exit 1
 fi
 
-exec ./"$bin" $@
+if [ ! -x "./$bin" ]; then
+  echo "Error: './$bin' not found or not executable"
+  ls -l
+  exit 1
+fi
+
+echo "Starting binary: $bin"
+exec "./$bin" "$@"
