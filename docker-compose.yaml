@@ -4,10 +4,9 @@ networks:
   servers:
 
 services:
-
   balancer:
     build: .
-    command: lb
+    command: balancer
     networks:
       - servers
     ports:
@@ -16,6 +15,8 @@ services:
   server1:
     build: .
     command: server
+    environment:
+      - SERVER_NAME=testrnasap
     networks:
       - servers
     ports:
@@ -24,6 +25,8 @@ services:
   server2:
     build: .
     command: server
+    environment:
+      - SERVER_NAME=server2
     networks:
       - servers
     ports:
@@ -32,6 +35,8 @@ services:
   server3:
     build: .
     command: server
+    environment:
+      - SERVER_NAME=server3
     networks:
       - servers
     ports:

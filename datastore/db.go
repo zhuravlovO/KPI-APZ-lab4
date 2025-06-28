@@ -2,189 +2,177 @@ package datastore
 
 import (
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
+
+var ErrNotFound = errors.New("record not found")
 
 const (
-	outFileName   = "current-data"
-	segmentPrefix = "segment-"
-	deleteMarker  = "__DELETE__"
-	segmentSize   = 1024
+	outFileNamePrefix = "segment-"
+	deleteMarker      = "__DELETE__"
 )
 
-var ErrNotFound = fmt.Errorf("record does not exist")
-
-type valuePos struct {
-	segmentId int
-	offset    int64
-}
-
 type Db struct {
-	dir           string
-	activeSegment *os.File
-	segmentId     int
-	segments      map[int]*os.File
-	index         map[string]valuePos
-	mu            sync.RWMutex
-	putCh         chan *entry
-	quitCh        chan struct{}
+	out         *os.File
+	outPath     string
+	outOffset   int64
+	dir         string
+	segmentSize int64
+	mu          sync.RWMutex
+	index       map[string]int64
 }
 
-func Open(dir string) (*Db, error) {
-	if err := os.MkdirAll(dir, 0777); err != nil {
-		return nil, err
-	}
-
+func NewDb(dir string, segmentSize int64) (*Db, error) {
 	db := &Db{
-		dir:      dir,
-		segments: make(map[int]*os.File),
-		index:    make(map[string]valuePos),
-		putCh:    make(chan *entry),
-		quitCh:   make(chan struct{}),
+		dir:         dir,
+		index:       make(map[string]int64),
+		segmentSize: segmentSize,
 	}
-
-	files, err := os.ReadDir(dir)
-	if err != nil {
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-
-	var segmentIds []int
-	for _, file := range files {
-		if strings.HasPrefix(file.Name(), segmentPrefix) {
-			idStr := strings.TrimPrefix(file.Name(), segmentPrefix)
-			id, err := strconv.Atoi(idStr)
-			if err == nil {
-				segmentIds = append(segmentIds, id)
-			}
-		}
-	}
-	sort.Ints(segmentIds)
-
-	for _, id := range segmentIds {
-		f, err := os.OpenFile(filepath.Join(dir, fmt.Sprintf("%s%d", segmentPrefix, id)), os.O_RDONLY, 0666)
-		if err != nil {
-			return nil, err
-		}
-		db.segments[id] = f
-		db.recover(f, id)
-	}
-
-	if len(segmentIds) > 0 {
-		db.segmentId = segmentIds[len(segmentIds)-1] + 1
-	} else {
-		db.segmentId = 0
-	}
-
-	outPath := filepath.Join(dir, outFileName)
-	f, err := os.OpenFile(outPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
+	if err := db.recover(); err != nil {
 		return nil, err
 	}
-	db.activeSegment = f
-	db.recover(f, db.segmentId)
-
-	go db.putLoop()
-	go db.compactionLoop()
-
-	return db, nil
-}
-
-func (db *Db) recover(f *os.File, segmentId int) {
-	var offset int64
-	for {
-		header := make([]byte, 8)
-		n, err := f.ReadAt(header, offset)
-		if err == io.EOF || n < 8 {
-			break
-		}
-		kl := binary.LittleEndian.Uint32(header)
-		vl := binary.LittleEndian.Uint32(header[4:])
-
-		data := make([]byte, kl+vl+8)
-		_, err = f.ReadAt(data, offset)
-		if err == io.EOF {
-			break
-		}
-
-		e := &entry{}
-		e.Decode(data)
-
-		if e.value == deleteMarker {
-			delete(db.index, e.key)
-		} else {
-			db.index[e.key] = valuePos{segmentId: segmentId, offset: offset}
-		}
-		offset += int64(8 + kl + vl)
-	}
+	return db, db.setOutFile()
 }
 
 func (db *Db) Close() error {
-	close(db.quitCh)
-	time.Sleep(100 * time.Millisecond)
+	return db.out.Close()
+}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	for _, f := range db.segments {
+func (db *Db) recover() error {
+	files, err := filepath.Glob(filepath.Join(db.dir, outFileNamePrefix+"*"))
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		f, err := os.Open(file)
+		if err != nil {
+			return err
+		}
+		var offset int64
+		for {
+			entry, size, err := readEntry(f)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				return err
+			}
+			if entry.value == deleteMarker {
+				delete(db.index, entry.key)
+			} else {
+				db.index[entry.key] = offset
+			}
+			offset += size
+		}
 		f.Close()
 	}
-	return db.activeSegment.Close()
+	return nil
+}
+
+func (db *Db) setOutFile() error {
+	files, err := filepath.Glob(filepath.Join(db.dir, outFileNamePrefix+"*"))
+	if err != nil {
+		return err
+	}
+	lastIndex := 0
+	if len(files) > 0 {
+		lastFile := files[len(files)-1]
+		parts := strings.Split(lastFile, "-")
+		lastIndex, _ = strconv.Atoi(parts[len(parts)-1])
+	}
+	newName := filepath.Join(db.dir, outFileNamePrefix+strconv.Itoa(lastIndex+1))
+	f, err := os.OpenFile(newName, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		return err
+	}
+	db.out = f
+	db.outPath = newName
+	db.outOffset = 0
+	return nil
+}
+
+func readEntry(r io.Reader) (*entry, int64, error) {
+	header := make([]byte, 8)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, 0, err
+	}
+	keySize := binary.LittleEndian.Uint32(header[0:4])
+	valueSize := binary.LittleEndian.Uint32(header[4:8])
+	data := make([]byte, keySize+valueSize)
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, 0, err
+	}
+	e := &entry{
+		key:   string(data[0:keySize]),
+		value: string(data[keySize:]),
+	}
+	return e, int64(8 + keySize + valueSize), nil
 }
 
 func (db *Db) Get(key string) (string, error) {
 	db.mu.RLock()
-	pos, ok := db.index[key]
+	offset, ok := db.index[key]
 	db.mu.RUnlock()
-
 	if !ok {
 		return "", ErrNotFound
 	}
-
-	var segmentFile *os.File
-	if pos.segmentId == db.segmentId {
-		f, err := os.Open(db.activeSegment.Name())
+	files, err := filepath.Glob(filepath.Join(db.dir, outFileNamePrefix+"*"))
+	if err != nil {
+		return "", err
+	}
+	for _, file := range files {
+		f, err := os.Open(file)
 		if err != nil {
 			return "", err
 		}
 		defer f.Close()
-		segmentFile = f
-	} else {
-		segmentFile = db.segments[pos.segmentId]
+		stat, err := f.Stat()
+		if err != nil {
+			return "", err
+		}
+		if offset < stat.Size() {
+			f.Seek(offset, 0)
+			entry, _, err := readEntry(f)
+			if err != nil {
+				return "", err
+			}
+			return entry.value, nil
+		}
 	}
-
-	header := make([]byte, 8)
-	_, err := segmentFile.ReadAt(header, pos.offset)
-	if err != nil {
-		return "", err
-	}
-	kl := binary.LittleEndian.Uint32(header)
-	vl := binary.LittleEndian.Uint32(header[4:])
-
-	data := make([]byte, 8+kl+vl)
-	_, err = segmentFile.ReadAt(data, pos.offset)
-	if err != nil {
-		return "", err
-	}
-
-	e := &entry{}
-	e.Decode(data)
-
-	if e.value == deleteMarker {
-		return "", ErrNotFound
-	}
-	return e.value, nil
+	return "", ErrNotFound
 }
 
 func (db *Db) Put(key, value string) error {
-	e := &entry{key, value}
-	db.putCh <- e
+	e := entry{key: key, value: value}
+	encoded := e.Encode()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.outOffset+int64(len(encoded)) > db.segmentSize {
+		if err := db.mergeSegments(); err != nil {
+			return err
+		}
+		if err := db.setOutFile(); err != nil {
+			return err
+		}
+	}
+	if _, err := db.out.Write(encoded); err != nil {
+		return err
+	}
+	if value == deleteMarker {
+		delete(db.index, key)
+	} else {
+		db.index[key] = db.outOffset
+	}
+	db.outOffset += int64(len(encoded))
 	return nil
 }
 
@@ -192,165 +180,60 @@ func (db *Db) Delete(key string) error {
 	return db.Put(key, deleteMarker)
 }
 
-func (db *Db) putLoop() {
-	for {
-		select {
-		case <-db.quitCh:
-			return
-		case e := <-db.putCh:
-			db.performPut(e.key, e.value)
-		}
-	}
-}
-
-func (db *Db) performPut(key, value string) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	fi, err := db.activeSegment.Stat()
+func (db *Db) mergeSegments() error {
+	mergedPath := filepath.Join(db.dir, "merged")
+	mergedFile, err := os.OpenFile(mergedPath, os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
-		return
+		return err
 	}
-	offset := fi.Size()
-
-	e := &entry{key, value}
-	data := e.Encode()
-	_, err = db.activeSegment.Write(data)
-	if err != nil {
-		return
-	}
-
-	if value == deleteMarker {
-		delete(db.index, key)
-	} else {
-		db.index[key] = valuePos{segmentId: db.segmentId, offset: offset}
-	}
-
-	if fi.Size() >= segmentSize {
-		db.activeSegment.Close()
-		oldPath := filepath.Join(db.dir, outFileName)
-		newPath := filepath.Join(db.dir, fmt.Sprintf("%s%d", segmentPrefix, db.segmentId))
-		os.Rename(oldPath, newPath)
-
-		f, _ := os.OpenFile(oldPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
-		db.activeSegment = f
-
-		segmentFile, _ := os.OpenFile(newPath, os.O_RDONLY, 0666)
-		db.segments[db.segmentId] = segmentFile
-
-		db.segmentId++
-	}
-}
-
-func (db *Db) compactionLoop() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-db.quitCh:
-			return
-		case <-ticker.C:
-			db.performCompaction()
+	defer mergedFile.Close()
+	newIndex := make(map[string]int64)
+	var newOffset int64
+	for key, offset := range db.index {
+		files, err := filepath.Glob(filepath.Join(db.dir, outFileNamePrefix+"*"))
+		if err != nil {
+			return err
+		}
+		for _, file := range files {
+			f, err := os.Open(file)
+			if err != nil {
+				return err
+			}
+			stat, err := f.Stat()
+			if err != nil {
+				f.Close()
+				return err
+			}
+			if offset < stat.Size() {
+				f.Seek(offset, 0)
+				entry, _, err := readEntry(f)
+				if err != nil {
+					f.Close()
+					return err
+				}
+				if entry.key == key && entry.value != deleteMarker {
+					encoded := entry.Encode()
+					if _, err := mergedFile.Write(encoded); err != nil {
+						f.Close()
+						return err
+					}
+					newIndex[key] = newOffset
+					newOffset += int64(len(encoded))
+				}
+				break
+			}
+			f.Close()
 		}
 	}
-}
-
-func (db *Db) performCompaction() {
-	db.mu.Lock()
-	if len(db.segments) < 2 {
-		db.mu.Unlock()
-		return
+	if err := os.Remove(db.out.Name()); err != nil {
+		return err
 	}
-
-	ids := make([]int, 0, len(db.segments))
-	for id := range db.segments {
-		ids = append(ids, id)
+	if err := mergedFile.Close(); err != nil {
+		return err
 	}
-	sort.Ints(ids)
-
-	if len(ids) < 2 {
-		db.mu.Unlock()
-		return
+	if err := os.Rename(mergedPath, db.outPath); err != nil {
+		return err
 	}
-	id1 := ids[0]
-	id2 := ids[1]
-
-	segment1Path := db.segments[id1].Name()
-	segment2Path := db.segments[id2].Name()
-	db.mu.Unlock()
-
-	tmpPath := segment1Path + ".tmp"
-	tmpFile, err := os.OpenFile(tmpPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
-		return
-	}
-
-	compactIndex := make(map[string]string)
-
-	db.readSegment(segment1Path, compactIndex)
-	db.readSegment(segment2Path, compactIndex)
-
-	for key, value := range compactIndex {
-		if value != deleteMarker {
-			e := entry{key, value}
-			tmpFile.Write(e.Encode())
-		}
-	}
-	tmpFile.Close()
-
-	os.Rename(tmpPath, segment1Path)
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	db.segments[id2].Close()
-	os.Remove(segment2Path)
-	delete(db.segments, id2)
-
-	db.segments[id1].Close()
-	mergedFile, _ := os.OpenFile(segment1Path, os.O_RDONLY, 0666)
-	db.segments[id1] = mergedFile
-
-	db.index = make(map[string]valuePos)
-	for id, f := range db.segments {
-		db.recover(f, id)
-	}
-	db.recover(db.activeSegment, db.segmentId)
-
-	fmt.Printf("Compaction complete: merged %d and %d into %d\n", id1, id2, id1)
-}
-
-func (db *Db) readSegment(path string, idx map[string]string) {
-	f, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	var offset int64
-	for {
-		header := make([]byte, 8)
-		n, err := f.ReadAt(header, offset)
-		if err == io.EOF || n < 8 {
-			break
-		}
-		kl := binary.LittleEndian.Uint32(header)
-		vl := binary.LittleEndian.Uint32(header[4:])
-
-		data := make([]byte, 8+kl+vl)
-		_, err = f.ReadAt(data, offset)
-		if err == io.EOF {
-			break
-		}
-		e := &entry{}
-		e.Decode(data)
-
-		if e.value == deleteMarker {
-			delete(idx, e.key)
-		} else {
-			idx[e.key] = e.value
-		}
-
-		offset += int64(8 + kl + vl)
-	}
+	db.index = newIndex
+	return nil
 }
